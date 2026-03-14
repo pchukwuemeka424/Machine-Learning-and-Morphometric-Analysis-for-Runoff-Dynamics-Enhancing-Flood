@@ -388,6 +388,17 @@ def train_models(models, X_train, y_train):
 def evaluate_model(model, X_test, y_test, model_name):
     """
     Evaluate a single model with comprehensive metrics.
+    
+    Args:
+        model: Trained model
+        X_test (DataFrame): Test features
+        y_test (Series): Test target
+        model_name (str): Name of the model
+        
+    Returns:
+        metrics (dict): Dictionary of evaluation metrics
+        y_pred (array): Predictions
+        y_prob (array): Prediction probabilities
     """
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
@@ -397,8 +408,14 @@ def evaluate_model(model, X_test, y_test, model_name):
         'Precision': precision_score(y_test, y_pred),
         'Recall': recall_score(y_test, y_pred),
         'F1-Score': f1_score(y_test, y_pred),
-        'ROC-AUC': roc_auc_score(y_test, y_prob)
+        'ROC-AUC': roc_auc_score(y_test, y_prob),
+        'Cohen Kappa': cohen_kappa_score(y_test, y_pred),
+        'Matthews Corr': matthews_corrcoef(y_test, y_pred)
     }
+    
+    # Calculate PR-AUC
+    precision, recall, _ = precision_recall_curve(y_test, y_prob)
+    metrics['PR-AUC'] = auc(recall, precision)
     
     # Print detailed classification report
     print(f"\n{model_name} Evaluation:")
@@ -469,6 +486,53 @@ def plot_roc_curves(trained_models, X_test, y_test):
     plt.savefig(os.path.join(OUTPUT_DIR, 'roc_curves.png'), dpi=300, bbox_inches='tight')
     print(f"ROC curves saved to {OUTPUT_DIR}/roc_curves.png")
 
+def plot_pr_curves(trained_models, X_test, y_test):
+    """Plot Precision-Recall curves for all trained models."""
+    plt.figure(figsize=(12, 8))
+    
+    for name, model in trained_models.items():
+        y_prob = model.predict_proba(X_test)[:, 1]
+        precision, recall, _ = precision_recall_curve(y_test, y_prob)
+        pr_auc = auc(recall, precision)
+        
+        plt.plot(
+            recall,
+            precision,
+            label=f'{name} (PR-AUC = {pr_auc:.3f})',
+            linewidth=2
+        )
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curves')
+    plt.legend(loc='lower left')
+    plt.grid(True, alpha=0.3)
+    
+    plt.savefig(os.path.join(OUTPUT_DIR, 'pr_curves.png'), dpi=300, bbox_inches='tight')
+    print(f"Precision-Recall curves saved to {OUTPUT_DIR}/pr_curves.png")
+
+def plot_feature_correlation(X, output_dir):
+    """Plot feature correlation heatmap."""
+    plt.figure(figsize=(12, 10))
+    corr_matrix = X.corr()
+    
+    sns.heatmap(
+        corr_matrix,
+        annot=True,
+        cmap='coolwarm',
+        center=0,
+        square=True,
+        fmt='.2f',
+        cbar_kws={'shrink': 0.8}
+    )
+    
+    plt.title('Feature Correlation Heatmap')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'feature_correlation.png'), dpi=300, bbox_inches='tight')
+    print(f"Feature correlation heatmap saved to {output_dir}/feature_correlation.png")
+
 def plot_feature_importance(model, X, model_name, output_dir):
     """Plot feature importance for tree-based models."""
     if hasattr(model, 'feature_importances_'):
@@ -517,6 +581,53 @@ def perform_shap_analysis(model, X_test, model_name):
     except Exception as e:
         print(f"SHAP analysis failed for {model_name}: {e}")
 
+def perform_lime_analysis(model, X_train, X_test, y_test, model_name):
+    """Perform LIME analysis for model interpretability."""
+    try:
+        print(f"\nPerforming LIME analysis for {model_name}...")
+        
+        # Create LIME explainer
+        if hasattr(model, 'named_steps'):
+            # For pipelines with scaler
+            scaler = model.named_steps['scaler']
+            classifier = model.named_steps['classifier']
+            
+            def predict_function(x):
+                return classifier.predict_proba(scaler.transform(x))
+            
+            explainer = lime.lime_tabular.LimeTabularExplainer(
+                np.array(X_train),
+                feature_names=X_train.columns,
+                class_names=['Non-Flood', 'Flood'],
+                verbose=True,
+                mode='classification'
+            )
+        else:
+            # For other models
+            explainer = lime.lime_tabular.LimeTabularExplainer(
+                np.array(X_train),
+                feature_names=X_train.columns,
+                class_names=['Non-Flood', 'Flood'],
+                verbose=True,
+                mode='classification'
+            )
+            
+            predict_function = model.predict_proba
+        
+        # Explain a random prediction
+        idx = np.random.randint(0, len(X_test))
+        exp = explainer.explain_instance(np.array(X_test.iloc[idx]), predict_function)
+        
+        # Save LIME explanation plot
+        plt.figure(figsize=(12, 8))
+        exp.as_pyplot_figure()
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f'{model_name.lower().replace(" ", "_")}_lime_explanation.png'), dpi=300, bbox_inches='tight')
+        
+        print(f"LIME analysis completed for {model_name}")
+    except Exception as e:
+        print(f"LIME analysis failed for {model_name}: {e}")
+
 def create_comparison_table(metrics_dict):
     """Create a comparison table of all model metrics."""
     df = pd.DataFrame(metrics_dict).T
@@ -532,20 +643,29 @@ def create_comparison_table(metrics_dict):
     df.to_csv(os.path.join(OUTPUT_DIR, 'model_comparison.csv'))
     print(f"\nComparison table saved to {OUTPUT_DIR}/model_comparison.csv")
 
-def main():
-    """Main pipeline for flood susceptibility modeling."""
+def main(data_path=None, tune_hyperparameters=False, feature_engineering=True):
+    """
+    Main pipeline for flood susceptibility modeling with enhanced features.
+    
+    Args:
+        data_path (str): Path to the data file (CSV or Excel)
+        tune_hyperparameters (bool): Whether to tune hyperparameters using GridSearchCV
+        feature_engineering (bool): Whether to perform feature engineering
+    """
     print("="*60)
     print("Flood Susceptibility Modeling Pipeline")
     print("="*60)
     
     # Step 1: Load and prepare data
-    X, y = load_data()
+    X, y = load_data(data_path)
     
     # Step 2: Preprocess data
-    X_train, X_test, y_train, y_test = preprocess_data(X, y)
+    X_train, X_test, y_train, y_test = preprocess_data(
+        X, y, test_size=0.2, feature_engineering=feature_engineering
+    )
     
     # Step 3: Create and train models
-    models = create_models()
+    models = create_models(tune_hyperparameters=tune_hyperparameters)
     trained_models = train_models(models, X_train, y_train)
     
     # Step 4: Evaluate all models
@@ -565,10 +685,13 @@ def main():
     # Step 6: Generate visualizations
     plot_confusion_matrices(trained_models, X_test, y_test)
     plot_roc_curves(trained_models, X_test, y_test)
+    plot_pr_curves(trained_models, X_test, y_test)
+    plot_feature_correlation(X_train, OUTPUT_DIR)
     
     for name, model in trained_models.items():
-        plot_feature_importance(model, X, name, OUTPUT_DIR)
+        plot_feature_importance(model, X_train, name, OUTPUT_DIR)
         perform_shap_analysis(model, X_test, name)
+        perform_lime_analysis(model, X_train, X_test, y_test, name)
     
     # Step 7: Cross-validation for robustness check
     print("\n" + "="*50)
@@ -578,7 +701,10 @@ def main():
     cv_scores = {}
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
     
-    for name, model in models.items():
+    # Use base models for cross-validation (not grid search instances)
+    base_models = create_baseline_models()
+    
+    for name, model in base_models.items():
         if name == 'SVM':
             pipeline = Pipeline([('scaler', StandardScaler()), ('classifier', model)])
             scores = cross_val_score(pipeline, X, y, cv=skf, scoring='roc_auc', n_jobs=-1)
@@ -616,10 +742,39 @@ def main():
     predictions_df.to_csv(os.path.join(OUTPUT_DIR, 'model_predictions.csv'), index=False)
     print(f"Predictions saved to {OUTPUT_DIR}/model_predictions.csv")
     
+    # Step 9: Save feature importance summary
+    save_feature_importance_summary(trained_models, X_train, OUTPUT_DIR)
+    
     print("\n" + "="*60)
     print("All analysis completed successfully!")
     print(f"Results saved in '{OUTPUT_DIR}' directory")
     print("="*60)
+
+def save_feature_importance_summary(trained_models, X, output_dir):
+    """Save feature importance summary across all tree-based models."""
+    importance_dfs = []
+    
+    for name, model in trained_models.items():
+        if hasattr(model, 'feature_importances_'):
+            importances = model.feature_importances_
+        elif hasattr(model, 'named_steps') and hasattr(model.named_steps['classifier'], 'feature_importances_'):
+            importances = model.named_steps['classifier'].feature_importances_
+        else:
+            continue
+            
+        df = pd.DataFrame({
+            'Feature': X.columns,
+            'Importance': importances,
+            'Model': name
+        })
+        importance_dfs.append(df)
+    
+    if importance_dfs:
+        all_importances = pd.concat(importance_dfs)
+        summary = all_importances.groupby('Feature')['Importance'].mean().sort_values(ascending=False)
+        
+        summary.to_csv(os.path.join(output_dir, 'feature_importance_summary.csv'))
+        print(f"Feature importance summary saved to {output_dir}/feature_importance_summary.csv")
 
 if __name__ == "__main__":
     main()
